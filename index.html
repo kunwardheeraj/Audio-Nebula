@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Audio-Reactive Nebula</title>
+    <!-- Load Tailwind CSS for modern, responsive styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Load Three.js library for 3D rendering -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <style>
+      /* Set body and html to full screen for an immersive experience */
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        height: 100%;
+        font-family: "Inter", sans-serif;
+        color: white;
+        background-color: #0d0d1a; /* Very dark purple/blue background */
+      }
+      /* Ensure the canvas covers the whole screen */
+      canvas {
+        display: block;
+        width: 100vw;
+        height: 100vh;
+      }
+    </style>
+  </head>
+  <body class="flex flex-col items-center justify-center">
+    <!-- The 3D scene will be rendered into this container -->
+    <div id="scene-container" class="absolute inset-0 z-0"></div>
+
+    <!-- UI Overlay for controls and messages (z-10 ensures it's on top of the canvas) -->
+    <div
+      id="ui-overlay"
+      class="absolute inset-0 z-10 p-6 flex flex-col justify-end items-center pointer-events-none"
+    >
+      <div
+        id="message-box"
+        class="bg-gray-800/80 p-4 rounded-xl shadow-2xl backdrop-blur-sm transition-opacity duration-500 max-w-lg w-full mb-8 pointer-events-auto"
+      >
+        <p class="text-lg font-semibold text-indigo-300 mb-2">
+          Welcome to the Audio Nebula
+        </p>
+        <p id="status-text" class="text-sm text-gray-200">
+          1. Click the button below to allow microphone access.
+        </p>
+      </div>
+
+      <button
+        id="start-button"
+        class="bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 px-8 rounded-full shadow-lg hover:shadow-xl transition duration-300 transform hover:scale-105 pointer-events-auto"
+      >
+        Start Visualization (Use Microphone)
+      </button>
+    </div>
+
+    <script>
+      // --- GLOBAL VARIABLES ---
+      let scene, camera, renderer;
+      let particles, particleGeometry, particleMaterial;
+      let analyser, audioContext, source;
+      const PARTICLE_COUNT = 15000;
+      let statusText;
+      let isAudioReady = false;
+
+      // --- UTILITY FUNCTIONS ---
+
+      /**
+       * Exponential backoff retry mechanism for API calls.
+       * Note: Not strictly needed for the local Web Audio API, but good practice for any fetch/API calls.
+       */
+      async function fetchWithRetry(url, options, maxRetries = 5) {
+        for (let i = 0; i < maxRetries; i++) {
+          try {
+            const response = await fetch(url, options);
+            if (!response.ok)
+              throw new Error(`HTTP error! status: ${response.status}`);
+            return response;
+          } catch (error) {
+            if (i === maxRetries - 1) {
+              console.error(
+                "Max retries reached. Failed to fetch:",
+                url,
+                error
+              );
+              throw error;
+            }
+            const delay = Math.pow(2, i) * 1000;
+            // console.warn(`Fetch failed. Retrying in ${delay / 1000}s...`);
+            await new Promise((resolve) => setTimeout(resolve, delay));
+          }
+        }
+      }
+
+      // Helper function to get the average amplitude of a frequency range
+      function getAverage(array, lowIndex, highIndex) {
+        let sum = 0;
+        for (let i = lowIndex; i <= highIndex; i++) {
+          sum += array[i];
+        }
+        return sum / (highIndex - lowIndex + 1);
+      }
+
+      // --- THREE.JS SETUP ---
+
+      function initThreeJS() {
+        const container = document.getElementById("scene-container");
+
+        // Scene setup
+        scene = new THREE.Scene();
+        scene.fog = new THREE.Fog(0x0d0d1a, 10, 100);
+
+        // Camera setup
+        const aspectRatio = container.clientWidth / container.clientHeight;
+        camera = new THREE.PerspectiveCamera(75, aspectRatio, 0.1, 1000);
+        camera.position.z = 10;
+        camera.position.y = 2; // Slight downward angle
+
+        // Renderer setup
+        renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(container.clientWidth, container.clientHeight);
+        container.appendChild(renderer.domElement);
+
+        // Particle System Setup
+        particleGeometry = new THREE.BufferGeometry();
+        const positions = new Float32Array(PARTICLE_COUNT * 3);
+        const sizes = new Float32Array(PARTICLE_COUNT);
+
+        for (let i = 0; i < PARTICLE_COUNT; i++) {
+          // Position particles randomly in a large box
+          positions[i * 3 + 0] = (Math.random() - 0.5) * 80; // X
+          positions[i * 3 + 1] = (Math.random() - 0.5) * 80; // Y
+          positions[i * 3 + 2] = (Math.random() - 0.5) * 80; // Z
+          sizes[i] = 1.0; // Initial size
+        }
+
+        particleGeometry.setAttribute(
+          "position",
+          new THREE.BufferAttribute(positions, 3)
+        );
+        particleGeometry.setAttribute(
+          "size",
+          new THREE.BufferAttribute(sizes, 1)
+        );
+
+        // Custom Shader Material for glowing particles
+        particleMaterial = new THREE.ShaderMaterial({
+          uniforms: {
+            color: { value: new THREE.Color(0x8800ff) }, // Base color: Bright purple
+            pointSize: { value: 1.0 }, // Base size for all particles
+            amplitude: { value: 0.0 }, // Uniform for audio amplitude
+          },
+          vertexShader: `
+                    attribute float size;
+                    uniform float pointSize;
+                    uniform float amplitude;
+
+                    void main() {
+                        vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+                        // Scale based on audio amplitude and distance from the center
+                        float distanceScale = length(position) / 50.0;
+                        gl_PointSize = (pointSize * size * (1.0 + amplitude * 5.0) + distanceScale) * (300.0 / -mvPosition.z);
+                        gl_Position = projectionMatrix * mvPosition;
+                    }
+                `,
+          fragmentShader: `
+                    uniform vec3 color;
+                    void main() {
+                        // Create a circular point with soft edges
+                        float r = 0.0;
+                        vec2 cxy = 2.0 * gl_PointCoord - 1.0;
+                        r = dot(cxy, cxy);
+
+                        // Fading the edges to create a soft glow effect
+                        if (r > 1.0) {
+                            discard;
+                        }
+
+                        // Use the circular point to color the fragment
+                        gl_FragColor = vec4(color, 1.0 - r);
+                    }
+                `,
+          blending: THREE.AdditiveBlending, // Makes the particles glow
+          depthTest: false,
+          transparent: true,
+        });
+
+        particles = new THREE.Points(particleGeometry, particleMaterial);
+        scene.add(particles);
+
+        // Handle window resizing
+        window.addEventListener("resize", onWindowResize, false);
+      }
+
+      function onWindowResize() {
+        const container = document.getElementById("scene-container");
+        const width = container.clientWidth;
+        const height = container.clientHeight;
+
+        camera.aspect = width / height;
+        camera.updateProjectionMatrix();
+        renderer.setSize(width, height);
+      }
+
+      // --- AUDIO ANALYSIS SETUP ---
+
+      async function setupAudio() {
+        try {
+          // Get microphone input stream
+          const stream = await navigator.mediaDevices.getUserMedia({
+            audio: true,
+          });
+
+          audioContext = new (window.AudioContext ||
+            window.webkitAudioContext)();
+          source = audioContext.createMediaStreamSource(stream);
+
+          analyser = audioContext.createAnalyser();
+          analyser.fftSize = 2048; // Fast Fourier Transform size (power of 2)
+
+          // Connect the microphone to the analyser
+          source.connect(analyser);
+
+          // Hide the message box and update status
+          document.getElementById("start-button").classList.add("hidden");
+          document.getElementById("message-box").classList.add("opacity-0");
+          statusText.textContent =
+            "Listening to your microphone... Make some noise!";
+
+          isAudioReady = true;
+          animate(); // Start the animation loop now that audio is ready
+        } catch (err) {
+          console.error("Error accessing microphone:", err);
+          statusText.innerHTML = `
+                    <span class="text-red-400">Error:</span> Could not access microphone.
+                    <br> Please ensure permissions are granted.
+                    <br> Visualization is running without audio reaction.
+                `;
+          document.getElementById("start-button").classList.add("hidden");
+          animate(); // Still start the animation for pure visual effect
+        }
+      }
+
+      // --- ANIMATION LOOP ---
+
+      function animate(time) {
+        requestAnimationFrame(animate);
+
+        // Rotate the particle system slowly
+        particles.rotation.y += 0.0005;
+        particles.rotation.x += 0.0002;
+
+        // Simple movement for the camera for a dynamic feel
+        camera.position.x = Math.sin(time * 0.00005) * 12;
+        camera.position.y = 2 + Math.sin(time * 0.00002) * 5;
+        camera.lookAt(scene.position);
+
+        if (isAudioReady) {
+          // Array to hold the frequency data
+          const bufferLength = analyser.frequencyBinCount;
+          const dataArray = new Uint8Array(bufferLength);
+          analyser.getByteFrequencyData(dataArray);
+
+          // Define frequency ranges (adjust indices based on fftSize/sampleRate)
+          // Lows (Bass): 20Hz - 250Hz (approx index 0 to 6)
+          // Mids (Vocals/Melody): 250Hz - 4kHz (approx index 7 to 100)
+          // Highs (Sizzle/Cymbals): 4kHz - 20kHz (approx index 101 to 512)
+
+          const bass = getAverage(dataArray, 0, 6) / 256;
+          const mids = getAverage(dataArray, 7, 100) / 256;
+          const highs = getAverage(dataArray, 101, 512) / 256;
+
+          // Overall volume for general pulse
+          const overallAmplitude = (bass + mids + highs) / 3;
+
+          // Update Three.js uniforms based on audio
+          particles.material.uniforms.amplitude.value = overallAmplitude * 0.5;
+
+          // Color shift based on mid/high frequencies
+          let r = overallAmplitude * 0.8 + 0.1;
+          let g = mids * 1.5;
+          let b = bass * 1.5;
+          particles.material.uniforms.color.value.setRGB(r, g, b);
+
+          // Add rotation speed based on highs
+          particles.rotation.y += highs * 0.01;
+        }
+
+        renderer.render(scene, camera);
+      }
+
+      // --- INITIALIZATION ---
+
+      window.onload = function () {
+        // Get UI elements
+        const startButton = document.getElementById("start-button");
+        statusText = document.getElementById("status-text");
+
+        // 1. Setup the 3D scene (This happens immediately)
+        initThreeJS();
+
+        // 2. Set up event listener to start audio processing
+        startButton.addEventListener("click", () => {
+          // If audio context exists, resume it (needed if it was suspended on initialization)
+          if (audioContext && audioContext.state === "suspended") {
+            audioContext.resume();
+          }
+          setupAudio();
+        });
+
+        // Start the non-audio animation loop initially
+        if (!isAudioReady) {
+          animate();
+        }
+      };
+    </script>
+  </body>
+</html>
